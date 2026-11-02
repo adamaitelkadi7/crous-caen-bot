@@ -1,19 +1,25 @@
 name: Surveillance CROUS Caen
 
 on:
-  # Toutes les heures (minute 37 pour éviter la congestion)
+  # Déclencheur principal : appel externe toutes les heures (cron-job.org)
+  workflow_dispatch:
+
+  # Secours : cron natif de GitHub (peu fiable, parfois jamais déclenché)
   schedule:
     - cron: "37 * * * *"
-
-  # Lancement manuel depuis l'onglet Actions
-  workflow_dispatch:
 
 permissions:
   contents: write   # Pour committer logements_vus.json
 
+# Jamais deux vérifications en même temps (évite les conflits sur l'état)
+concurrency:
+  group: surveillance-crous
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout du dépôt
@@ -31,7 +37,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SEARCH_URL: ${{ vars.SEARCH_URL || 'https://trouverunlogement.lescrous.fr/tools/47/search?bounds=-0.413777_49.2162655_-0.3307282_49.1530145&locationName=Caen+%2814000%29' }}
+          SEARCH_URL: ${{ vars.SEARCH_URL }}
         run: python crous_watch.py
 
       - name: Sauvegarder l'état
@@ -39,5 +45,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add logements_vus.json
-          git diff --cached --quiet || git commit -m "🏠 Mise à jour état $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git push
+          if git diff --cached --quiet; then
+            echo "Rien à sauvegarder"
+            exit 0
+          fi
+          git commit -m "🏠 État $(date -u +'%Y-%m-%d %H:%M UTC')"
+          for i in 1 2 3; do
+            git pull --rebase --quiet && git push && exit 0
+            sleep 5
+          done
+          exit 1
