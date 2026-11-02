@@ -149,12 +149,19 @@ def load_state() -> dict | None:
     return data
 
 
+def current_hour() -> str:
+    return time.strftime("%Y-%m-%d %Hh UTC", time.gmtime())
+
+
 def save_state(seen_ids: set[str]):
+    """Écrit l'état. Le champ 'heartbeat' (à l'heure près) fait qu'il y a au
+    plus un commit par heure quand rien ne change : une trace que le bot tourne,
+    sans créer un commit à chaque vérification (toutes les 5 min)."""
     STATE_FILE.write_text(json.dumps({
         "initialized": True,
         "seen_ids": sorted(seen_ids),
-        "last_check": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "count": len(seen_ids),
+        "heartbeat": current_hour(),
     }, indent=2, ensure_ascii=False) + "\n")
 
 
@@ -248,7 +255,7 @@ def main() -> int:
             f"✅ <b>Bot CROUS initialisé !</b>\n"
             f"📍 Zone : {html.escape(LOCATION_NAME)}\n"
             f"📊 {len(current)} logement(s) disponible(s) en ce moment.\n"
-            f"🔔 Je vérifie toutes les heures et je te préviens dès qu'un nouveau apparaît."
+            f"🔔 Je vérifie toutes les 5 minutes et je te préviens dès qu'un nouveau apparaît."
         )
         print(f"   Premier run : {len(current)} logement(s) enregistré(s)")
         return 0 if ok else 1
@@ -278,7 +285,8 @@ def main() -> int:
     gone = seen_ids - set(current)
     if gone:
         print(f"   ℹ️  {len(gone)} logement(s) disparu(s) (probablement réservés)")
-    save_state(set(current))
+    if set(current) != seen_ids or state.get("heartbeat") != current_hour():
+        save_state(set(current))
     return 0
 
 

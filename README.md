@@ -1,47 +1,40 @@
 # 🏠 Bot CROUS Caen — Surveillance de logements
 
-Surveille automatiquement [trouverunlogement.lescrous.fr](https://trouverunlogement.lescrous.fr/tools/47/search?bounds=-0.413777_49.2162655_-0.3307282_49.1530145&locationName=Caen+%2814000%29) **toutes les heures** et t'envoie une **notification Telegram** dès qu'un nouveau logement apparaît à Caen.
+Surveille [trouverunlogement.lescrous.fr](https://trouverunlogement.lescrous.fr/tools/47/search?bounds=-0.413777_49.2162655_-0.3307282_49.1530145&locationName=Caen+%2814000%29) **toutes les 5 minutes** et envoie une **notification Telegram** dès qu'un nouveau logement apparaît à Caen.
 
-Tourne sur **GitHub Actions** — gratuit, 24/7, PC éteint.
+Tourne dans le cloud, gratuitement, PC éteint.
 
-## Installation rapide (10 min)
+## Comment ça marche
 
-### 1. Créer le bot Telegram
+```
+cron-job.org (toutes les 5 min)
+   └─► API GitHub : lance le workflow « Surveillance CROUS Caen »
+          └─► crous_watch.py
+                 ├─► API CROUS (POST /api/fr/search/47) : logements de la zone
+                 ├─► compare avec logements_vus.json
+                 └─► nouveau logement ? → message Telegram
+```
 
-1. Ouvre Telegram → cherche **@BotFather**
-2. Envoie `/newbot` → donne un nom (ex: "CROUS Caen Bot")
-3. Note le **token** (format : `123456:ABC-DEF...`)
-4. Envoie un message quelconque à ton nouveau bot
-5. Va sur `https://api.telegram.org/bot<TON_TOKEN>/getUpdates`
-6. Note ton **chat_id** (nombre dans `"chat":{"id": XXXXXX}`)
+- **cron-job.org** déclenche le workflow (le cron natif de GitHub est gardé en secours, mais il ne se déclenche pas toujours).
+- **logements_vus.json** garde les logements déjà signalés. Il n'est commité que si la liste change, plus une trace par heure (`heartbeat`).
+- Si un logement est réservé puis se libère à nouveau, une nouvelle alerte est envoyée.
+- Si le site du CROUS ou Telegram ne répond pas, le run échoue (croix rouge, mail de GitHub) et l'état n'est pas modifié.
 
-### 2. Créer le dépôt GitHub
+## Configuration
 
-1. Va sur [github.com/new](https://github.com/new)
-2. Nom : `crous-caen-bot` — **Public** (= minutes Actions illimitées)
-3. Pousse ces fichiers dedans
-
-### 3. Ajouter les secrets
-
-Sur GitHub → **Settings** → **Secrets and variables** → **Actions** → **New repository secret** :
-
-| Nom | Valeur |
-|-----|--------|
-| `TELEGRAM_BOT_TOKEN` | Le token du BotFather |
-| `TELEGRAM_CHAT_ID` | Ton chat_id |
-
-### 4. Lancer !
-
-Onglet **Actions** → workflow "Surveillance CROUS Caen" → **Run workflow**
-
-Le premier run enregistre l'existant sans t'alerter. Ensuite, toutes les heures, tu reçois une notif Telegram s'il y a du nouveau.
+| Où | Quoi |
+|----|------|
+| GitHub → Settings → Secrets → Actions | `TELEGRAM_BOT_TOKEN` (token BotFather), `TELEGRAM_CHAT_ID` |
+| GitHub → Settings → Variables → Actions (optionnel) | `SEARCH_URL` : URL de recherche copiée depuis le site CROUS |
+| cron-job.org | POST `https://api.github.com/repos/adamaitelkadi7/crous-caen-bot/actions/workflows/surveillance.yml/dispatches`, corps `{"ref":"main"}`, en-tête `Authorization: Bearer <token GitHub>` |
+| Token GitHub (fine-grained) | Dépôt `crous-caen-bot` uniquement, permission « Actions : Read and write » — expire le 31/10/2027 |
 
 ## FAQ
 
-**Changer la fréquence ?** → Modifier le `cron` dans `.github/workflows/surveillance.yml`
-- Toutes les 30 min : `*/30 * * * *`
-- Toutes les 2h : `0 */2 * * *`
+**Changer la fréquence ?** → Sur cron-job.org, modifier l'intervalle du cronjob. Éviter de descendre sous 5 min.
 
-**Changer la ville ?** → Sur le site CROUS, filtre ta ville, copie l'URL, mets-la dans la variable `SEARCH_URL` (Settings → Variables → Actions)
+**Changer de ville ?** → Sur le site CROUS, cherche ta ville, copie l'URL et mets-la dans la variable `SEARCH_URL`.
 
-**GitHub désactive le workflow ?** → Après 60j sans activité, GitHub envoie un mail. Clique "Enable" pour réactiver.
+**Nouvelle phase CROUS ?** → L'URL du site change (`/tools/47/...` devient un autre numéro) : mets la nouvelle URL dans `SEARCH_URL`.
+
+**Plus de notifications ?** → Onglet Actions : croix rouges = regarder le journal du run. Historique des appels : cron-job.org → Cronjobs → Historique. Token expiré : en créer un nouveau et le coller dans cron-job.org.
