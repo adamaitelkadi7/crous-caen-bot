@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 🏠 CROUS Caen — Surveillance de logements
-Vérifie l'API du CROUS toutes les heures et envoie une notif Telegram
+Interroge l'API du CROUS toutes les heures et envoie une notif Telegram
 quand un nouveau logement apparaît.
 
 Déployable sur GitHub Actions (gratuit, 24/7, PC éteint).
 """
 
+import html
 import json
 import os
 import re
@@ -19,12 +20,12 @@ import requests
 
 # ── Configuration ──────────────────────────────────────────────────
 # L'URL copiée depuis la barre d'adresse du site CROUS
-SEARCH_URL = os.getenv(
-    "SEARCH_URL",
+DEFAULT_SEARCH_URL = (
     "https://trouverunlogement.lescrous.fr/tools/47/search"
     "?bounds=-0.413777_49.2162655_-0.3307282_49.1530145"
     "&locationName=Caen+%2814000%29"
 )
+SEARCH_URL = os.getenv("SEARCH_URL") or DEFAULT_SEARCH_URL
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -32,97 +33,138 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # Fichier d'état : mémorise les logements déjà vus
 STATE_FILE = Path(os.getenv("STATE_FILE", "logements_vus.json"))
 
-# ── Extraction des paramètres depuis l'URL ─────────────────────────
-def parse_search_url(url: str) -> tuple[str, dict]:
-    """Convertit l'URL du site en URL d'API + paramètres."""
+BASE = "https://trouverunlogement.lescrous.fr"
+PAGE_SIZE = 100
+MAX_PAGES = 10
+
+OCCUPATION_LABELS = {
+    "alone": "Individuel",
+    "couple": "Couple",
+    "house_sharing": "Colocation",
+}
+
+
+class CrousError(Exception):
+    """L'API du CROUS n'a pas répondu correctement."""
+
+
+# ── Lecture de l'URL de recherche ──────────────────────────────────
+def parse_search_url(url: str) -> tuple[str, list[dict], str]:
+    """Extrait l'id de la phase (tool), la zone géographique et le nom du lieu."""
     parsed = urlparse(url)
-    # /tools/47/search → /api/fr/search/47
     match = re.search(r"/tools/(\d+)/search", parsed.path)
     if not match:
         raise ValueError(f"URL invalide, pas de /tools/XX/search : {url}")
     tool_id = match.group(1)
-    api_url = f"https://trouverunlogement.lescrous.fr/api/fr/search/{tool_id}"
 
     params = parse_qs(parsed.query)
-    # Aplatir les listes (parse_qs renvoie des listes)
-    flat_params = {k: v[0] for k, v in params.items()}
-    return api_url, flat_params
+    bounds = params.get("bounds", [None])[0]
+    if not bounds:
+        raise ValueError("L'URL doit contenir un paramètre bounds=... (zone de la carte)")
+    parts = [float(x) for x in bounds.split("_")]
+    if len(parts) != 4:
+        raise ValueError(f"Paramètre bounds inattendu : {bounds}")
+    # bounds = lonOuest_latNord_lonEst_latSud
+    location = [
+        {"lon": parts[0], "lat": parts[1]},
+        {"lon": parts[2], "lat": parts[3]},
+    ]
+    location_name = params.get("locationName", ["la zone choisie"])[0]
+    return tool_id, location, location_name
+
+
+TOOL_ID, LOCATION, LOCATION_NAME = parse_search_url(SEARCH_URL)
 
 
 # ── Requête API ────────────────────────────────────────────────────
-def fetch_logements() -> list[dict]:
-    """Interroge l'API CROUS et retourne la liste des logements."""
-    api_url, params = parse_search_url(SEARCH_URL)
-
+def fetch_page(page: int) -> dict:
+    """Appelle l'API de recherche (POST) pour une page de résultats."""
+    body = {
+        "idTool": int(TOOL_ID),
+        "need_aggregation": False,
+        "page": page,
+        "pageSize": PAGE_SIZE,
+        "sector": None,
+        "occupationModes": [],
+        "location": LOCATION,
+        "residence": None,
+        "precision": 6,
+        "equipment": [],
+        "price": {"max": 10000000},
+        "area": {"min": 0},
+        "toolMechanism": "flow",
+    }
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
-        "Referer": "https://trouverunlogement.lescrous.fr/",
+        "Content-Type": "application/json",
+        "Origin": BASE,
+        "Referer": SEARCH_URL,
     }
+    url = f"{BASE}/api/fr/search/{TOOL_ID}"
 
-    retries = 3
-    for attempt in range(retries):
+    last_error = None
+    for attempt in range(1, 4):
         try:
-            resp = requests.get(api_url, params=params, headers=headers, timeout=30)
-            if resp.status_code == 400 and attempt < retries - 1:
-                # L'API CROUS renvoie parfois un 400 aléatoire
-                time.sleep(2)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            # La réponse peut être une liste directe ou un objet avec une clé
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                # Chercher la liste de résultats dans les clés courantes
-                for key in ("results", "items", "data", "logements", "content"):
-                    if key in data and isinstance(data[key], list):
-                        return data[key]
-                # Si c'est un dict avec "count" ou "total", la liste peut être vide
-                if data.get("count", data.get("total", -1)) == 0:
-                    return []
-                # Sinon retourner les valeurs si ça ressemble à un résultat unique
-                return [data] if "id" in data else []
-            return []
-        except requests.exceptions.RequestException as e:
-            if attempt < retries - 1:
-                time.sleep(2)
-                continue
-            print(f"❌ Erreur après {retries} tentatives : {e}")
-            return []
-    return []
+            resp = requests.post(url, json=body, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "results" not in data or "items" not in data["results"]:
+                    raise CrousError(f"Réponse inattendue : {str(data)[:200]}")
+                return data["results"]
+            last_error = f"HTTP {resp.status_code}"
+        except (requests.exceptions.RequestException, ValueError) as e:
+            last_error = str(e)
+        # L'API CROUS renvoie parfois des erreurs aléatoires : on réessaie
+        time.sleep(3 * attempt)
+    raise CrousError(f"Échec après 3 tentatives ({last_error})")
+
+
+def fetch_logements() -> list[dict]:
+    """Récupère tous les logements de la zone (toutes les pages)."""
+    items: list[dict] = []
+    for page in range(1, MAX_PAGES + 1):
+        results = fetch_page(page)
+        batch = results["items"]
+        items.extend(batch)
+        total = results.get("total", {}).get("value", len(items))
+        if len(batch) < PAGE_SIZE or len(items) >= total:
+            break
+    return items
 
 
 # ── Gestion de l'état (logements déjà vus) ─────────────────────────
-def load_seen() -> set:
-    """Charge les IDs des logements déjà vus."""
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text())
-            return set(data.get("seen_ids", []))
-        except (json.JSONDecodeError, KeyError):
-            return set()
-    return set()
+def load_state() -> dict | None:
+    """Retourne l'état sauvegardé, ou None si le bot n'a jamais été initialisé."""
+    if not STATE_FILE.exists():
+        return None
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except json.JSONDecodeError:
+        return None
+    if not data.get("initialized"):
+        return None
+    return data
 
 
-def save_seen(seen_ids: set):
-    """Sauvegarde les IDs des logements vus."""
+def save_state(seen_ids: set[str]):
     STATE_FILE.write_text(json.dumps({
+        "initialized": True,
         "seen_ids": sorted(seen_ids),
         "last_check": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "count": len(seen_ids),
-    }, indent=2, ensure_ascii=False))
+    }, indent=2, ensure_ascii=False) + "\n")
 
 
 # ── Notification Telegram ──────────────────────────────────────────
-def send_telegram(message: str):
-    """Envoie un message via le bot Telegram."""
+def send_telegram(message: str) -> bool:
+    """Envoie un message via le bot Telegram. Retourne True si c'est passé."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️  Telegram non configuré, message affiché ici :")
         print(message)
-        return
+        return True
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -131,102 +173,114 @@ def send_telegram(message: str):
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        print("✅ Notification Telegram envoyée")
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Erreur Telegram : {e}")
+    for attempt in range(1, 4):
+        try:
+            resp = requests.post(url, json=payload, timeout=15)
+            if resp.ok:
+                print("✅ Notification Telegram envoyée")
+                return True
+            print(f"❌ Telegram a répondu {resp.status_code} : {resp.text[:200]}")
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Erreur Telegram : {e}")
+        time.sleep(2 * attempt)
+    return False
 
 
-def format_logement(logement: dict) -> str:
+def euros(cents) -> str:
+    """L'API donne les loyers en centimes : 26599 -> '265,99 €'."""
+    value = cents / 100
+    text = f"{value:.0f}" if value == int(value) else f"{value:.2f}".replace(".", ",")
+    return f"{text} €"
+
+
+def format_logement(lg: dict) -> str:
     """Formate un logement pour le message Telegram."""
-    # Extraire les champs courants (l'API peut varier)
-    title = logement.get("title", logement.get("label", "Logement"))
-    residence = logement.get("residence", logement.get("residenceLabel", ""))
-    price = logement.get("price", logement.get("lolessFees", ""))
-    surface = logement.get("surface", logement.get("area", ""))
-    address = logement.get("address", logement.get("location", ""))
-    logement_id = logement.get("id", "")
+    esc = lambda s: html.escape(str(s)) if s else ""
+    residence = lg.get("residence") or {}
+    lines = [f"🏠 <b>{esc(lg.get('label') or 'Logement')}</b>"]
 
-    lines = [f"🏠 <b>{title}</b>"]
-    if residence:
-        lines.append(f"📍 {residence}")
-    if address:
-        lines.append(f"📫 {address}")
-    if price:
-        lines.append(f"💰 {price} €/mois")
-    if surface:
-        lines.append(f"📐 {surface} m²")
-    if logement_id:
-        link = f"https://trouverunlogement.lescrous.fr/tools/47/search?id={logement_id}"
+    if residence.get("label"):
+        lines.append(f"🏢 {esc(residence['label'])}")
+    if residence.get("address"):
+        lines.append(f"📍 {esc(residence['address'])}")
+
+    for mode in lg.get("occupationModes") or []:
+        rent = mode.get("rent") or {}
+        lo, hi = rent.get("min"), rent.get("max")
+        if lo is None:
+            continue
+        price = euros(lo) if lo == hi or hi is None else f"{euros(lo)} – {euros(hi)}"
+        kind = OCCUPATION_LABELS.get(mode.get("type"), mode.get("type", ""))
+        lines.append(f"💰 {price}/mois ({esc(kind)})")
+
+    area = lg.get("area") or {}
+    if area.get("min"):
+        surf = area["min"] if area.get("min") == area.get("max") else f"{area['min']}–{area['max']}"
+        lines.append(f"📐 {surf} m²")
+
+    if lg.get("id"):
+        link = f"{BASE}/tools/{TOOL_ID}/accommodations/{lg['id']}"
         lines.append(f'🔗 <a href="{link}">Voir / Réserver</a>')
 
     return "\n".join(lines)
 
 
-# ── Boucle principale ─────────────────────────────────────────────
-def main():
-    print(f"🔍 Vérification CROUS Caen — {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
+# ── Programme principal ────────────────────────────────────────────
+def main() -> int:
+    print(f"🔍 Vérification CROUS — {LOCATION_NAME} — "
+          f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
 
-    logements = fetch_logements()
-    seen_ids = load_seen()
-    is_first_run = not STATE_FILE.exists() or len(seen_ids) == 0
+    try:
+        logements = fetch_logements()
+    except CrousError as e:
+        # On ne touche pas à l'état : le run sera marqué en échec (croix rouge)
+        print(f"❌ API CROUS : {e}")
+        return 1
 
-    print(f"   Trouvé : {len(logements)} logement(s) en ligne")
+    current = {str(lg["id"]): lg for lg in logements if lg.get("id") is not None}
+    print(f"   Trouvé : {len(current)} logement(s) en ligne")
+
+    state = load_state()
+    if state is None:
+        # Premier lancement : on enregistre l'existant sans spammer
+        save_state(set(current))
+        ok = send_telegram(
+            f"✅ <b>Bot CROUS initialisé !</b>\n"
+            f"📍 Zone : {html.escape(LOCATION_NAME)}\n"
+            f"📊 {len(current)} logement(s) disponible(s) en ce moment.\n"
+            f"🔔 Je vérifie toutes les heures et je te préviens dès qu'un nouveau apparaît."
+        )
+        print(f"   Premier run : {len(current)} logement(s) enregistré(s)")
+        return 0 if ok else 1
+
+    seen_ids = set(state.get("seen_ids", []))
     print(f"   Déjà vus : {len(seen_ids)}")
+    new_ids = [i for i in current if i not in seen_ids]
 
-    # Extraire les IDs des logements actuels
-    current_ids = set()
-    new_logements = []
+    if new_ids:
+        print(f"   🆕 {len(new_ids)} NOUVEAU(X) logement(s) !")
+        header = (f"🔔 <b>{len(new_ids)} nouveau(x) logement(s) CROUS — "
+                  f"{html.escape(LOCATION_NAME)} !</b>\n\n")
+        body = "\n\n".join(format_logement(current[i]) for i in new_ids[:8])
+        if len(new_ids) > 8:
+            body += f"\n\n… et {len(new_ids) - 8} autre(s)"
+        body += f'\n\n👉 <a href="{html.escape(SEARCH_URL)}">Ouvrir la recherche CROUS</a>'
 
-    for logement in logements:
-        lid = str(logement.get("id", ""))
-        if not lid:
-            # Fallback : utiliser un hash du titre + résidence
-            lid = str(hash(json.dumps(logement, sort_keys=True)))
-        current_ids.add(lid)
-        if lid not in seen_ids:
-            new_logements.append(logement)
-
-    if is_first_run:
-        # Premier lancement : enregistrer l'existant sans notifier
-        save_seen(current_ids)
-        msg = (
-            f"✅ Bot CROUS Caen initialisé !\n"
-            f"📊 {len(current_ids)} logement(s) enregistré(s).\n"
-            f"🔔 Tu seras notifié dès qu'un nouveau apparaît."
-        )
-        send_telegram(msg)
-        print(f"   Premier run : {len(current_ids)} logement(s) enregistré(s)")
-        return
-
-    if new_logements:
-        print(f"   🆕 {len(new_logements)} NOUVEAU(X) logement(s) !")
-        header = f"🔔 <b>{len(new_logements)} nouveau(x) logement(s) CROUS à Caen !</b>\n"
-        body = "\n\n".join(format_logement(l) for l in new_logements[:5])
-
-        if len(new_logements) > 5:
-            body += f"\n\n… et {len(new_logements) - 5} autre(s)"
-
-        body += (
-            "\n\n👉 <a href=\"https://trouverunlogement.lescrous.fr/tools/47/search"
-            "?bounds=-0.413777_49.2162655_-0.3307282_49.1530145"
-            "&locationName=Caen+%2814000%29\">Ouvrir le site CROUS</a>"
-        )
-
-        send_telegram(header + body)
+        if not send_telegram(header + body):
+            # Notification ratée : on ne marque pas ces logements comme vus,
+            # pour réessayer au prochain passage.
+            return 1
     else:
         print("   Pas de nouveau logement.")
 
-    # Mettre à jour l'état (union pour ne pas perdre les anciens)
-    save_seen(seen_ids | current_ids)
-
-    # Logements disparus ?
-    removed = seen_ids - current_ids
-    if removed:
-        print(f"   ℹ️  {len(removed)} logement(s) disparu(s) (probablement réservés)")
+    # On ne garde que ce qui est en ligne maintenant : si un logement est
+    # réservé puis se libère à nouveau (désistement), tu seras re-prévenu.
+    gone = seen_ids - set(current)
+    if gone:
+        print(f"   ℹ️  {len(gone)} logement(s) disparu(s) (probablement réservés)")
+    save_state(set(current))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
