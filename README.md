@@ -1,6 +1,6 @@
 # 🏠 Bot CROUS Caen — Surveillance de logements
 
-Surveille [trouverunlogement.lescrous.fr](https://trouverunlogement.lescrous.fr/tools/47/search?bounds=-0.413777_49.2162655_-0.3307282_49.1530145&locationName=Caen+%2814000%29) **toutes les 5 minutes** et envoie une **notification Telegram** dès qu'un nouveau logement apparaît à Caen.
+Surveille [trouverunlogement.lescrous.fr](https://trouverunlogement.lescrous.fr/tools/47/search?bounds=-0.413777_49.2247942_-0.304511_49.1530145&locationName=Caen+%2B+H%C3%A9rouville-Saint-Clair) **toutes les 5 minutes** et envoie une **notification Telegram** dès qu'un nouveau logement apparaît à **Caen ou Hérouville-Saint-Clair**.
 
 Tourne dans le cloud, gratuitement, PC éteint.
 

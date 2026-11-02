@@ -20,10 +20,12 @@ import requests
 
 # ── Configuration ──────────────────────────────────────────────────
 # L'URL copiée depuis la barre d'adresse du site CROUS
+# Zone = Caen (14000) + Hérouville-Saint-Clair (14200) : union des deux cadres
+# de carte renvoyés par le site CROUS pour chaque ville.
 DEFAULT_SEARCH_URL = (
     "https://trouverunlogement.lescrous.fr/tools/47/search"
-    "?bounds=-0.413777_49.2162655_-0.3307282_49.1530145"
-    "&locationName=Caen+%2814000%29"
+    "?bounds=-0.413777_49.2247942_-0.304511_49.1530145"
+    "&locationName=Caen+%2B+H%C3%A9rouville-Saint-Clair"
 )
 SEARCH_URL = os.getenv("SEARCH_URL") or DEFAULT_SEARCH_URL
 
