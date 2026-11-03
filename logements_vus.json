@@ -1,6 +1,7 @@
 {
-  "initialized": true,
-  "seen_ids": [],
-  "count": 0,
-  "heartbeat": "2026-11-03 14h UTC"
+  "heartbeat": "2026-11-03 15h UTC",
+  "last_daily": "2026-11-03",
+  "tool_id": 48,
+  "logements_surveilles": 16,
+  "available": {}
 }
