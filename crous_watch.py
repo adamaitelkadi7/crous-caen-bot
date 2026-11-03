@@ -72,34 +72,41 @@ class CrousError(Exception):
 
 # ── Recherche des logements de la zone ─────────────────────────────
 def search(tool_id: int) -> list[dict]:
-    """Liste tous les logements de la zone (complets ou non)."""
-    body = {
-        "idTool": tool_id,
-        "need_aggregation": False,
-        "page": 1,
-        "pageSize": 200,
-        "sector": None,
-        "occupationModes": [],
-        "location": LOCATION,
-        "residence": None,
-        "precision": 6,
-        "equipment": [],
-        "price": {"min": 0, "max": 10000000},
-        "area": {"min": 0},
-        "toolMechanism": "residual",
-    }
+    """Liste tous les logements de la zone (complets ou non).
+    Plusieurs variantes de requête sont essayées : l'API CROUS renvoie parfois
+    503 selon la forme de la requête ou la charge du serveur."""
+    referer = (f"{BASE}/tools/{tool_id}/search?bounds="
+               f"{LOCATION[0]['lon']}_{LOCATION[0]['lat']}_{LOCATION[1]['lon']}_{LOCATION[1]['lat']}")
+    variants = [("flow", 100), ("residual", 100), ("flow", 50)]
     last_error = None
-    for attempt in range(1, 4):
+    for attempt, (mechanism, size) in enumerate(variants * 2, start=1):
+        body = {
+            "idTool": tool_id,
+            "need_aggregation": False,
+            "page": 1,
+            "pageSize": size,
+            "sector": None,
+            "occupationModes": [],
+            "location": LOCATION,
+            "residence": None,
+            "precision": 6,
+            "equipment": [],
+            "price": {"max": 10000000},
+            "area": {"min": 0},
+            "toolMechanism": mechanism,
+        }
         try:
-            resp = SESSION.post(f"{BASE}/api/fr/search/{tool_id}", json=body, timeout=(5, 20))
+            resp = SESSION.post(f"{BASE}/api/fr/search/{tool_id}", json=body,
+                                headers={"Referer": referer}, timeout=(5, 20))
+            print(f"   recherche tools/{tool_id} ({mechanism}, {size}) -> HTTP {resp.status_code}")
             if resp.status_code == 200:
-                data = resp.json()
-                return data["results"]["items"]
+                return resp.json()["results"]["items"]
             last_error = f"HTTP {resp.status_code}"
         except (requests.exceptions.RequestException, ValueError, KeyError) as e:
             last_error = str(e)
-        time.sleep(3 * attempt)
-    raise CrousError(f"Recherche impossible après 3 tentatives ({last_error})")
+            print(f"   recherche tools/{tool_id} -> {type(e).__name__}")
+        time.sleep(4 * attempt)
+    raise CrousError(f"Recherche impossible ({last_error})")
 
 
 def find_active_tool() -> tuple[int, list[dict]]:
