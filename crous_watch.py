@@ -1,43 +1,45 @@
 #!/usr/bin/env python3
 """
-🏠 CROUS Caen — Surveillance de logements
-Interroge l'API du CROUS toutes les heures et envoie une notif Telegram
-quand un nouveau logement apparaît.
+🏠 CROUS Caen + Hérouville — Surveillance des PLACES LIBRES
+Vérifie, pour chaque logement de la zone, si une période est réellement
+réservable (individuel, coloc, couple) et envoie une alerte Telegram dès
+qu'une place s'ouvre.
 
 Déployable sur GitHub Actions (gratuit, 24/7, PC éteint).
 """
 
+import datetime as dt
 import html
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
 
 import requests
 
 # ── Configuration ──────────────────────────────────────────────────
-# L'URL copiée depuis la barre d'adresse du site CROUS
-# Zone = Caen (14000) + Hérouville-Saint-Clair (14200) : union des deux cadres
-# de carte renvoyés par le site CROUS pour chaque ville.
-DEFAULT_SEARCH_URL = (
-    "https://trouverunlogement.lescrous.fr/tools/47/search"
-    "?bounds=-0.413777_49.2247942_-0.304511_49.1530145"
-    "&locationName=Caen+%2B+H%C3%A9rouville-Saint-Clair"
-)
-SEARCH_URL = os.getenv("SEARCH_URL") or DEFAULT_SEARCH_URL
+BASE = "https://trouverunlogement.lescrous.fr"
+
+# Campagne CROUS en cours (le numéro dans l'URL : /tools/48/...).
+# Si la campagne change, le bot essaie automatiquement les numéros suivants.
+TOOL_ID = int(os.getenv("CROUS_TOOL_ID") or 48)
+
+# Zone : tout Caen + Hérouville-Saint-Clair (Bacot, Côte de Nacre, Lebisey,
+# Satie, Gremillon, André Breton, Flora Tristan…)
+LOCATION = [
+    {"lon": -0.50, "lat": 49.25},   # coin nord-ouest
+    {"lon": -0.25, "lat": 49.12},   # coin sud-est
+]
+LOCATION_NAME = "Caen + Hérouville-Saint-Clair"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Fichier d'état : mémorise les logements déjà vus
 STATE_FILE = Path(os.getenv("STATE_FILE", "logements_vus.json"))
 
-BASE = "https://trouverunlogement.lescrous.fr"
-PAGE_SIZE = 100
-MAX_PAGES = 10
+# Heure (UTC) à partir de laquelle le message de contrôle quotidien part
+DAILY_REPORT_HOUR_UTC = 7   # = 8h ou 9h à Paris
 
 OCCUPATION_LABELS = {
     "alone": "Individuel",
@@ -45,136 +47,124 @@ OCCUPATION_LABELS = {
     "house_sharing": "Colocation",
 }
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Origin": BASE,
+    "Referer": f"{BASE}/",
+}
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
 
 class CrousError(Exception):
     """L'API du CROUS n'a pas répondu correctement."""
 
 
-# ── Lecture de l'URL de recherche ──────────────────────────────────
-def parse_search_url(url: str) -> tuple[str, list[dict], str]:
-    """Extrait l'id de la phase (tool), la zone géographique et le nom du lieu."""
-    parsed = urlparse(url)
-    match = re.search(r"/tools/(\d+)/search", parsed.path)
-    if not match:
-        raise ValueError(f"URL invalide, pas de /tools/XX/search : {url}")
-    tool_id = match.group(1)
-
-    params = parse_qs(parsed.query)
-    bounds = params.get("bounds", [None])[0]
-    if not bounds:
-        raise ValueError("L'URL doit contenir un paramètre bounds=... (zone de la carte)")
-    parts = [float(x) for x in bounds.split("_")]
-    if len(parts) != 4:
-        raise ValueError(f"Paramètre bounds inattendu : {bounds}")
-    # bounds = lonOuest_latNord_lonEst_latSud
-    location = [
-        {"lon": parts[0], "lat": parts[1]},
-        {"lon": parts[2], "lat": parts[3]},
-    ]
-    location_name = params.get("locationName", ["la zone choisie"])[0]
-    return tool_id, location, location_name
-
-
-TOOL_ID, LOCATION, LOCATION_NAME = parse_search_url(SEARCH_URL)
-
-
-# ── Requête API ────────────────────────────────────────────────────
-def fetch_page(page: int) -> dict:
-    """Appelle l'API de recherche (POST) pour une page de résultats."""
+# ── Recherche des logements de la zone ─────────────────────────────
+def search(tool_id: int) -> list[dict]:
+    """Liste tous les logements de la zone (complets ou non)."""
     body = {
-        "idTool": int(TOOL_ID),
+        "idTool": tool_id,
         "need_aggregation": False,
-        "page": page,
-        "pageSize": PAGE_SIZE,
+        "page": 1,
+        "pageSize": 200,
         "sector": None,
         "occupationModes": [],
         "location": LOCATION,
         "residence": None,
         "precision": 6,
         "equipment": [],
-        "price": {"max": 10000000},
+        "price": {"min": 0, "max": 10000000},
         "area": {"min": 0},
-        "toolMechanism": "flow",
+        "toolMechanism": "residual",
     }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": BASE,
-        "Referer": SEARCH_URL,
-    }
-    url = f"{BASE}/api/fr/search/{TOOL_ID}"
-
     last_error = None
     for attempt in range(1, 4):
         try:
-            resp = requests.post(url, json=body, headers=headers, timeout=30)
+            resp = SESSION.post(f"{BASE}/api/fr/search/{tool_id}", json=body, timeout=30)
             if resp.status_code == 200:
                 data = resp.json()
-                if "results" not in data or "items" not in data["results"]:
-                    raise CrousError(f"Réponse inattendue : {str(data)[:200]}")
-                return data["results"]
+                return data["results"]["items"]
             last_error = f"HTTP {resp.status_code}"
-        except (requests.exceptions.RequestException, ValueError) as e:
+        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
             last_error = str(e)
-        # L'API CROUS renvoie parfois des erreurs aléatoires : on réessaie
         time.sleep(3 * attempt)
-    raise CrousError(f"Échec après 3 tentatives ({last_error})")
+    raise CrousError(f"Recherche impossible après 3 tentatives ({last_error})")
 
 
-def fetch_logements() -> list[dict]:
-    """Récupère tous les logements de la zone (toutes les pages)."""
-    items: list[dict] = []
-    for page in range(1, MAX_PAGES + 1):
-        results = fetch_page(page)
-        batch = results["items"]
-        items.extend(batch)
-        total = results.get("total", {}).get("value", len(items))
-        if len(batch) < PAGE_SIZE or len(items) >= total:
-            break
-    return items
+def find_active_tool() -> tuple[int, list[dict]]:
+    """Trouve la campagne en cours : TOOL_ID, sinon les numéros suivants."""
+    for tool_id in range(TOOL_ID, TOOL_ID + 4):
+        items = search(tool_id)
+        if items:
+            return tool_id, items
+    return TOOL_ID, []
 
 
-# ── Gestion de l'état (logements déjà vus) ─────────────────────────
-def load_state() -> dict | None:
-    """Retourne l'état sauvegardé, ou None si le bot n'a jamais été initialisé."""
+# ── Disponibilités réelles ─────────────────────────────────────────
+def windows_to_test(today: dt.date) -> list[tuple[dt.date, dt.date]]:
+    """Fenêtres de séjour testées : une place qui se libère maintenant,
+    puis au début de chacun des 3 mois suivants (1 mois minimum)."""
+    starts = [today + dt.timedelta(days=2)]
+    d = today.replace(day=1)
+    for _ in range(3):
+        d = (d + dt.timedelta(days=32)).replace(day=1)
+        starts.append(d)
+    return [(s, s + dt.timedelta(days=31)) for s in starts]
+
+
+def best_period(tool_id: int, acc_id: int, mode: str, today: dt.date) -> dict | None:
+    """Renvoie une période réservable pour ce logement/mode, sinon None.
+    On essaie d'abord la plus longue (jusqu'à fin août), puis des fenêtres d'1 mois."""
+    end_of_year = dt.date(today.year + (1 if today.month >= 9 else 0), 8, 31)
+    tries = [(today + dt.timedelta(days=2), end_of_year)] + windows_to_test(today)
+    for arrival, departure in tries:
+        if departure <= arrival:
+            continue
+        url = (f"{BASE}/api/fr/tools/{tool_id}/accommodations/{acc_id}/availabilities"
+               f"?occupationMode={mode}&arrivalDate={arrival}&departureDate={departure}")
+        try:
+            resp = SESSION.get(url, timeout=20)
+        except requests.exceptions.RequestException:
+            continue
+        # 400 = pas de stock pour ce mode (fréquent pour « couple ») -> rien
+        if resp.status_code != 200:
+            continue
+        try:
+            periods = resp.json().get("periodsAvailable") or []
+        except ValueError:
+            continue
+        if periods:
+            return periods[0]
+        time.sleep(0.15)
+    return None
+
+
+# ── État ───────────────────────────────────────────────────────────
+def load_state() -> dict:
     if not STATE_FILE.exists():
-        return None
+        return {}
     try:
-        data = json.loads(STATE_FILE.read_text())
+        return json.loads(STATE_FILE.read_text())
     except json.JSONDecodeError:
-        return None
-    if not data.get("initialized"):
-        return None
-    return data
+        return {}
 
 
-def current_hour() -> str:
-    return time.strftime("%Y-%m-%d %Hh UTC", time.gmtime())
+def save_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
 
 
-def save_state(seen_ids: set[str]):
-    """Écrit l'état. Le champ 'heartbeat' (à l'heure près) fait qu'il y a au
-    plus un commit par heure quand rien ne change : une trace que le bot tourne,
-    sans créer un commit à chaque vérification (toutes les 5 min)."""
-    STATE_FILE.write_text(json.dumps({
-        "initialized": True,
-        "seen_ids": sorted(seen_ids),
-        "count": len(seen_ids),
-        "heartbeat": current_hour(),
-    }, indent=2, ensure_ascii=False) + "\n")
-
-
-# ── Notification Telegram ──────────────────────────────────────────
+# ── Telegram ───────────────────────────────────────────────────────
 def send_telegram(message: str) -> bool:
-    """Envoie un message via le bot Telegram. Retourne True si c'est passé."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️  Telegram non configuré, message affiché ici :")
+        print("⚠️ Telegram non configuré, message affiché ici :")
         print(message)
         return True
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -196,99 +186,101 @@ def send_telegram(message: str) -> bool:
 
 
 def euros(cents) -> str:
-    """L'API donne les loyers en centimes : 26599 -> '265,99 €'."""
     value = cents / 100
-    text = f"{value:.0f}" if value == int(value) else f"{value:.2f}".replace(".", ",")
-    return f"{text} €"
+    return f"{value:.2f}".replace(".", ",") + " €"
 
 
-def format_logement(lg: dict) -> str:
-    """Formate un logement pour le message Telegram."""
+def fmt_date(s: str) -> str:
+    return dt.date.fromisoformat(s[:10]).strftime("%d/%m/%Y")
+
+
+def format_alert(tool_id: int, lg: dict, mode: dict, period: dict) -> str:
     esc = lambda s: html.escape(str(s)) if s else ""
-    residence = lg.get("residence") or {}
-    lines = [f"🏠 <b>{esc(lg.get('label') or 'Logement')}</b>"]
-
-    if residence.get("label"):
-        lines.append(f"🏢 {esc(residence['label'])}")
-    if residence.get("address"):
-        lines.append(f"📍 {esc(residence['address'])}")
-
-    for mode in lg.get("occupationModes") or []:
-        rent = mode.get("rent") or {}
-        lo, hi = rent.get("min"), rent.get("max")
-        if lo is None:
-            continue
-        price = euros(lo) if lo == hi or hi is None else f"{euros(lo)} – {euros(hi)}"
-        kind = OCCUPATION_LABELS.get(mode.get("type"), mode.get("type", ""))
-        lines.append(f"💰 {price}/mois ({esc(kind)})")
-
-    area = lg.get("area") or {}
-    if area.get("min"):
-        surf = area["min"] if area.get("min") == area.get("max") else f"{area['min']}–{area['max']}"
-        lines.append(f"📐 {surf} m²")
-
-    if lg.get("id"):
-        link = f"{BASE}/tools/{TOOL_ID}/accommodations/{lg['id']}"
-        lines.append(f'🔗 <a href="{link}">Voir / Réserver</a>')
-
+    res = lg.get("residence") or {}
+    rent = (mode.get("rent") or {}).get("min")
+    lines = [
+        f"🏠 <b>{esc(lg.get('label') or 'Logement')}</b>",
+        f"🏢 {esc(res.get('label'))}",
+        f"📍 {esc(res.get('address'))}",
+        f"👤 {OCCUPATION_LABELS.get(mode.get('type'), mode.get('type'))}"
+        + (f" — 💰 {euros(rent)}/mois" if rent else ""),
+        f"📅 Dispo du {fmt_date(period['arrivalDate'])} au {fmt_date(period['departureDate'])}",
+        f'🔗 <a href="{BASE}/tools/{tool_id}/accommodations/{lg["id"]}">Réserver vite !</a>',
+    ]
     return "\n".join(lines)
 
 
 # ── Programme principal ────────────────────────────────────────────
 def main() -> int:
-    print(f"🔍 Vérification CROUS — {LOCATION_NAME} — "
-          f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
+    now = dt.datetime.now(dt.timezone.utc)
+    today = now.date()
+    print(f"🔍 Vérification CROUS — {LOCATION_NAME} — {now:%Y-%m-%d %H:%M UTC}")
+
+    state = load_state()
 
     try:
-        logements = fetch_logements()
+        tool_id, logements = find_active_tool()
     except CrousError as e:
-        # On ne touche pas à l'état : le run sera marqué en échec (croix rouge)
         print(f"❌ API CROUS : {e}")
         return 1
 
-    current = {str(lg["id"]): lg for lg in logements if lg.get("id") is not None}
-    print(f"   Trouvé : {len(current)} logement(s) en ligne")
+    print(f"   Campagne : tools/{tool_id} — {len(logements)} logement(s) dans la zone")
 
-    state = load_state()
-    if state is None:
-        # Premier lancement : on enregistre l'existant sans spammer
-        save_state(set(current))
-        ok = send_telegram(
-            f"✅ <b>Bot CROUS initialisé !</b>\n"
-            f"📍 Zone : {html.escape(LOCATION_NAME)}\n"
-            f"📊 {len(current)} logement(s) disponible(s) en ce moment.\n"
-            f"🔔 Je vérifie toutes les 5 minutes et je te préviens dès qu'un nouveau apparaît."
-        )
-        print(f"   Premier run : {len(current)} logement(s) enregistré(s)")
-        return 0 if ok else 1
+    # Garde-fou : zone vide = campagne changée ou site modifié -> prévenir 1x/jour
+    if not logements:
+        if state.get("empty_warned") != str(today):
+            send_telegram("⚠️ <b>Bot CROUS : 0 logement trouvé dans la zone.</b>\n"
+                          "La campagne CROUS a peut-être changé. Vérifie le numéro "
+                          "/tools/XX/ dans l'URL du site.")
+            state["empty_warned"] = str(today)
+            save_state(state)
+        return 0
 
-    seen_ids = set(state.get("seen_ids", []))
-    print(f"   Déjà vus : {len(seen_ids)}")
-    new_ids = [i for i in current if i not in seen_ids]
+    # Vérifie chaque logement × chaque type d'occupation
+    available: dict[str, dict] = {}
+    alerts: list[str] = []
+    for lg in logements:
+        for mode in lg.get("occupationModes") or []:
+            mtype = mode.get("type")
+            if not mtype:
+                continue
+            period = best_period(tool_id, lg["id"], mtype, today)
+            if period:
+                key = f"{lg['id']}|{mtype}"
+                available[key] = {"arrival": period["arrivalDate"][:10],
+                                  "departure": period["departureDate"][:10]}
+                print(f"   ✅ PLACE : {lg.get('label')} ({mtype}) {period['arrivalDate'][:10]}")
+                if key not in (state.get("available") or {}):
+                    alerts.append(format_alert(tool_id, lg, mode, period))
 
-    if new_ids:
-        print(f"   🆕 {len(new_ids)} NOUVEAU(X) logement(s) !")
-        header = (f"🔔 <b>{len(new_ids)} nouveau(x) logement(s) CROUS — "
-                  f"{html.escape(LOCATION_NAME)} !</b>\n\n")
-        body = "\n\n".join(format_logement(current[i]) for i in new_ids[:8])
-        if len(new_ids) > 8:
-            body += f"\n\n… et {len(new_ids) - 8} autre(s)"
-        body += f'\n\n👉 <a href="{html.escape(SEARCH_URL)}">Ouvrir la recherche CROUS</a>'
+    print(f"   Places libres maintenant : {len(available)}")
 
-        if not send_telegram(header + body):
-            # Notification ratée : on ne marque pas ces logements comme vus,
-            # pour réessayer au prochain passage.
-            return 1
-    else:
-        print("   Pas de nouveau logement.")
+    if alerts:
+        msg = (f"🚨 <b>{len(alerts)} PLACE(S) CROUS LIBRE(S) — {html.escape(LOCATION_NAME)} !</b>\n\n"
+               + "\n\n".join(alerts[:8]))
+        if len(alerts) > 8:
+            msg += f"\n\n… et {len(alerts) - 8} autre(s)"
+        if not send_telegram(msg):
+            return 1   # on réessaiera au prochain passage
 
-    # On ne garde que ce qui est en ligne maintenant : si un logement est
-    # réservé puis se libère à nouveau (désistement), tu seras re-prévenu.
-    gone = seen_ids - set(current)
-    if gone:
-        print(f"   ℹ️  {len(gone)} logement(s) disparu(s) (probablement réservés)")
-    if set(current) != seen_ids or state.get("heartbeat") != current_hour():
-        save_state(set(current))
+    # Message de contrôle quotidien : preuve que le bot tourne
+    if now.hour >= DAILY_REPORT_HOUR_UTC and state.get("last_daily") != str(today):
+        send_telegram(f"🤖 <b>Bot CROUS OK</b> ({now:%d/%m})\n"
+                      f"📍 {html.escape(LOCATION_NAME)} — campagne tools/{tool_id}\n"
+                      f"🏢 {len(logements)} logements surveillés\n"
+                      f"🔑 {len(available)} place(s) libre(s) en ce moment")
+        state["last_daily"] = str(today)
+
+    state.update({
+        "tool_id": tool_id,
+        "logements_surveilles": len(logements),
+        "available": available,
+        "heartbeat": now.strftime("%Y-%m-%d %Hh UTC"),
+    })
+    state.pop("seen_ids", None)
+    state.pop("count", None)
+    state.pop("initialized", None)
+    save_state(state)
     return 0
 
 
