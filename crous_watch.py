@@ -130,10 +130,15 @@ def best_period(tool_id: int, acc_id: int, mode: str, today: dt.date) -> dict | 
             continue
         url = (f"{BASE}/api/fr/tools/{tool_id}/accommodations/{acc_id}/availabilities"
                f"?occupationMode={mode}&arrivalDate={arr}&departureDate={dep}")
-        try:
-            resp = SESSION.get(url, timeout=(5, 10))
-        except requests.exceptions.RequestException as e:
-            print(f"   ⚠️ {acc_id}/{mode} : {type(e).__name__}")
+        resp = None
+        for retry in range(3):   # le serveur CROUS est lent : on réessaie
+            try:
+                resp = SESSION.get(url, timeout=(8, 20))
+                break
+            except requests.exceptions.RequestException as e:
+                print(f"   ⚠️ {acc_id}/{mode} : {type(e).__name__} (essai {retry + 1})")
+                time.sleep(2 + 2 * retry)
+        if resp is None:
             continue
         # 400 = pas de stock pour ce mode (fréquent pour « couple ») -> rien
         if resp.status_code != 200:
@@ -244,7 +249,7 @@ def main() -> int:
     jobs = [(lg, mode) for lg in logements for mode in (lg.get("occupationModes") or [])
             if mode.get("type")]
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(
             lambda j: best_period(tool_id, j[0]["id"], j[1]["type"], today), jobs))
     print(f"   {len(jobs)} vérifications en {time.time() - t0:.1f}s")
