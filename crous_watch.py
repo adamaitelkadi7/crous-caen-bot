@@ -9,6 +9,7 @@ Déployable sur GitHub Actions (gratuit, 24/7, PC éteint).
 """
 
 import datetime as dt
+import functools
 import html
 import json
 import os
@@ -17,6 +18,10 @@ import time
 from pathlib import Path
 
 import requests
+from concurrent.futures import ThreadPoolExecutor
+
+# Affichage immédiat des logs dans GitHub Actions
+print = functools.partial(print, flush=True)
 
 # ── Configuration ──────────────────────────────────────────────────
 BASE = "https://trouverunlogement.lescrous.fr"
@@ -86,7 +91,7 @@ def search(tool_id: int) -> list[dict]:
     last_error = None
     for attempt in range(1, 4):
         try:
-            resp = SESSION.post(f"{BASE}/api/fr/search/{tool_id}", json=body, timeout=30)
+            resp = SESSION.post(f"{BASE}/api/fr/search/{tool_id}", json=body, timeout=(5, 20))
             if resp.status_code == 200:
                 data = resp.json()
                 return data["results"]["items"]
@@ -107,30 +112,21 @@ def find_active_tool() -> tuple[int, list[dict]]:
 
 
 # ── Disponibilités réelles ─────────────────────────────────────────
-def windows_to_test(today: dt.date) -> list[tuple[dt.date, dt.date]]:
-    """Fenêtres de séjour testées : une place qui se libère maintenant,
-    puis au début de chacun des 3 mois suivants (1 mois minimum)."""
-    starts = [today + dt.timedelta(days=2)]
-    d = today.replace(day=1)
-    for _ in range(3):
-        d = (d + dt.timedelta(days=32)).replace(day=1)
-        starts.append(d)
-    return [(s, s + dt.timedelta(days=31)) for s in starts]
-
-
 def best_period(tool_id: int, acc_id: int, mode: str, today: dt.date) -> dict | None:
     """Renvoie une période réservable pour ce logement/mode, sinon None.
-    On essaie d'abord la plus longue (jusqu'à fin août), puis des fenêtres d'1 mois."""
+    Teste : place à l'année (jusqu'au 31/08) puis place d'au moins 1 mois."""
+    arrival = today + dt.timedelta(days=2)
     end_of_year = dt.date(today.year + (1 if today.month >= 9 else 0), 8, 31)
-    tries = [(today + dt.timedelta(days=2), end_of_year)] + windows_to_test(today)
-    for arrival, departure in tries:
-        if departure <= arrival:
+    tries = [(arrival, end_of_year), (arrival, arrival + dt.timedelta(days=31))]
+    for arr, dep in tries:
+        if dep <= arr:
             continue
         url = (f"{BASE}/api/fr/tools/{tool_id}/accommodations/{acc_id}/availabilities"
-               f"?occupationMode={mode}&arrivalDate={arrival}&departureDate={departure}")
+               f"?occupationMode={mode}&arrivalDate={arr}&departureDate={dep}")
         try:
-            resp = SESSION.get(url, timeout=20)
-        except requests.exceptions.RequestException:
+            resp = SESSION.get(url, timeout=(5, 10))
+        except requests.exceptions.RequestException as e:
+            print(f"   ⚠️ {acc_id}/{mode} : {type(e).__name__}")
             continue
         # 400 = pas de stock pour ce mode (fréquent pour « couple ») -> rien
         if resp.status_code != 200:
@@ -141,7 +137,6 @@ def best_period(tool_id: int, acc_id: int, mode: str, today: dt.date) -> dict | 
             continue
         if periods:
             return periods[0]
-        time.sleep(0.15)
     return None
 
 
@@ -239,19 +234,23 @@ def main() -> int:
     # Vérifie chaque logement × chaque type d'occupation
     available: dict[str, dict] = {}
     alerts: list[str] = []
-    for lg in logements:
-        for mode in lg.get("occupationModes") or []:
-            mtype = mode.get("type")
-            if not mtype:
-                continue
-            period = best_period(tool_id, lg["id"], mtype, today)
-            if period:
-                key = f"{lg['id']}|{mtype}"
-                available[key] = {"arrival": period["arrivalDate"][:10],
-                                  "departure": period["departureDate"][:10]}
-                print(f"   ✅ PLACE : {lg.get('label')} ({mtype}) {period['arrivalDate'][:10]}")
-                if key not in (state.get("available") or {}):
-                    alerts.append(format_alert(tool_id, lg, mode, period))
+    jobs = [(lg, mode) for lg in logements for mode in (lg.get("occupationModes") or [])
+            if mode.get("type")]
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(
+            lambda j: best_period(tool_id, j[0]["id"], j[1]["type"], today), jobs))
+    print(f"   {len(jobs)} vérifications en {time.time() - t0:.1f}s")
+    for (lg, mode), period in zip(jobs, results):
+        if not period:
+            continue
+        mtype = mode["type"]
+        key = f"{lg['id']}|{mtype}"
+        available[key] = {"arrival": period["arrivalDate"][:10],
+                          "departure": period["departureDate"][:10]}
+        print(f"   ✅ PLACE : {lg.get('label')} ({mtype}) {period['arrivalDate'][:10]}")
+        if key not in (state.get("available") or {}):
+            alerts.append(format_alert(tool_id, lg, mode, period))
 
     print(f"   Places libres maintenant : {len(available)}")
 
