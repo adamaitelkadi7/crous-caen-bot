@@ -46,6 +46,9 @@ STATE_FILE = Path(os.getenv("STATE_FILE", "logements_vus.json"))
 # Heure (UTC) à partir de laquelle le message de contrôle quotidien part
 DAILY_REPORT_HOUR_UTC = 7   # = 8h ou 9h à Paris
 
+# Pause entre deux requêtes : le CROUS bloque les rafales venant de GitHub
+REQUEST_PAUSE = 1.0
+
 OCCUPATION_LABELS = {
     "alone": "Individuel",
     "couple": "Couple",
@@ -119,37 +122,43 @@ def find_active_tool() -> tuple[int, list[dict]]:
 
 
 # ── Disponibilités réelles ─────────────────────────────────────────
-def best_period(tool_id: int, acc_id: int, mode: str, today: dt.date) -> dict | None:
-    """Renvoie une période réservable pour ce logement/mode, sinon None.
-    Teste : place à l'année (jusqu'au 31/08) puis place d'au moins 1 mois."""
-    arrival = today + dt.timedelta(days=2)
-    end_of_year = dt.date(today.year + (1 if today.month >= 9 else 0), 8, 31)
-    tries = [(arrival, end_of_year), (arrival, arrival + dt.timedelta(days=31))]
-    for arr, dep in tries:
-        if dep <= arr:
+def check_window(tool_id: int, acc_id: int, mode: str, arr: dt.date, dep: dt.date) -> list | None:
+    """Une requête de disponibilité. None = pas de réponse exploitable."""
+    url = (f"{BASE}/api/fr/tools/{tool_id}/accommodations/{acc_id}/availabilities"
+           f"?occupationMode={mode}&arrivalDate={arr}&departureDate={dep}")
+    for retry in range(3):   # le serveur CROUS est lent : on réessaie
+        try:
+            resp = SESSION.get(url, timeout=(8, 20))
+        except requests.exceptions.RequestException as e:
+            print(f"   ⚠️ {acc_id}/{mode} : {type(e).__name__} (essai {retry + 1})")
+            time.sleep(5 + 5 * retry)
             continue
-        url = (f"{BASE}/api/fr/tools/{tool_id}/accommodations/{acc_id}/availabilities"
-               f"?occupationMode={mode}&arrivalDate={arr}&departureDate={dep}")
-        resp = None
-        for retry in range(3):   # le serveur CROUS est lent : on réessaie
-            try:
-                resp = SESSION.get(url, timeout=(8, 20))
-                break
-            except requests.exceptions.RequestException as e:
-                print(f"   ⚠️ {acc_id}/{mode} : {type(e).__name__} (essai {retry + 1})")
-                time.sleep(2 + 2 * retry)
-        if resp is None:
-            continue
+        finally:
+            time.sleep(REQUEST_PAUSE)
         # 400 = pas de stock pour ce mode (fréquent pour « couple ») -> rien
         if resp.status_code != 200:
-            continue
+            return []
         try:
-            periods = resp.json().get("periodsAvailable") or []
+            return resp.json().get("periodsAvailable") or []
         except ValueError:
-            continue
-        if periods:
-            return periods[0]
+            return None
     return None
+
+
+def best_period(tool_id: int, acc_id: int, mode: str, today: dt.date) -> dict | None:
+    """Renvoie une période réservable pour ce logement/mode, sinon None.
+    1 requête pour savoir s'il y a une place (au moins 1 mois dès maintenant),
+    puis, seulement si oui, 1 requête pour voir si c'est dispo jusqu'au 31/08."""
+    arrival = today + dt.timedelta(days=2)
+    periods = check_window(tool_id, acc_id, mode, arrival, arrival + dt.timedelta(days=31))
+    if not periods:
+        return None
+    end_of_year = dt.date(today.year + (1 if today.month >= 9 else 0), 8, 31)
+    if end_of_year > arrival + dt.timedelta(days=31):
+        longer = check_window(tool_id, acc_id, mode, arrival, end_of_year)
+        if longer:
+            return longer[0]
+    return periods[0]
 
 
 # ── État ───────────────────────────────────────────────────────────
@@ -249,7 +258,7 @@ def main() -> int:
     jobs = [(lg, mode) for lg in logements for mode in (lg.get("occupationModes") or [])
             if mode.get("type")]
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         results = list(pool.map(
             lambda j: best_period(tool_id, j[0]["id"], j[1]["type"], today), jobs))
     print(f"   {len(jobs)} vérifications en {time.time() - t0:.1f}s")
