@@ -38,6 +38,17 @@ LOCATION = [
 ]
 LOCATION_NAME = "Caen + Hérouville-Saint-Clair"
 
+# Logements que la recherche CROUS cache parfois quand ils sont complets :
+# on les vérifie quand même à chaque passage.
+EXTRA_LOGEMENTS = [
+    (3040, "STUDIO BACOT 20M", "RESIDENCE BACOT", ["alone"]),
+    (2032, "T1 BACOT 20M", "RESIDENCE BACOT", ["alone"]),
+    (1431, "T1 BIS BACOT 30M CL", "RESIDENCE BACOT", ["house_sharing", "couple"]),
+    (95, "T1 BIS BACOT 30M PMR CL", "RESIDENCE BACOT", ["house_sharing"]),
+    (1432, "T2 BACOT 50M CP", "RESIDENCE BACOT", ["couple"]),
+    (2054, "Chambre confort CDN", "RESIDENCE COTE DE NACRE", ["alone"]),
+]
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -255,6 +266,12 @@ def main() -> int:
     # Vérifie chaque logement × chaque type d'occupation
     available: dict[str, dict] = {}
     alerts: list[str] = []
+    found_ids = {lg.get("id") for lg in logements}
+    for acc_id, label, residence, modes in EXTRA_LOGEMENTS:
+        if acc_id not in found_ids:
+            logements.append({"id": acc_id, "label": label,
+                              "residence": {"label": residence, "address": "Caen"},
+                              "occupationModes": [{"type": m} for m in modes]})
     jobs = [(lg, mode) for lg in logements for mode in (lg.get("occupationModes") or [])
             if mode.get("type")]
     t0 = time.time()
