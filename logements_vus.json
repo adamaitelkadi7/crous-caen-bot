@@ -4,10 +4,6 @@
   "tool_id": 48,
   "logements_surveilles": 8,
   "available": {
-    "1982|alone": {
-      "arrival": "2026-11-06",
-      "departure": "2027-08-31"
-    },
     "2054|alone": {
       "arrival": "2026-11-06",
       "departure": "2027-08-31"
