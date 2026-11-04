@@ -3,5 +3,10 @@
   "last_daily": "2026-11-04",
   "tool_id": 48,
   "logements_surveilles": 8,
-  "available": {}
+  "available": {
+    "2054|alone": {
+      "arrival": "2026-11-06",
+      "departure": "2027-08-31"
+    }
+  }
 }
