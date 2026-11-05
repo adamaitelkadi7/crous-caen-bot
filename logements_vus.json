@@ -2,12 +2,8 @@
   "heartbeat": "2026-11-05 10h UTC",
   "last_daily": "2026-11-05",
   "tool_id": 48,
-  "logements_surveilles": 8,
+  "logements_surveilles": 6,
   "available": {
-    "1406|alone": {
-      "arrival": "2026-11-07",
-      "departure": "2027-08-31"
-    },
     "2054|alone": {
       "arrival": "2026-11-07",
       "departure": "2027-08-31"
