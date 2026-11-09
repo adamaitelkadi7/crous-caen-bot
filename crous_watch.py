@@ -27,7 +27,8 @@ print = functools.partial(print, flush=True)
 BASE = "https://trouverunlogement.lescrous.fr"
 
 # Campagne CROUS en cours (le numéro dans l'URL : /tools/48/...).
-# Si la campagne change, le bot essaie automatiquement les numéros suivants.
+# Si la campagne change, le bot prend automatiquement une campagne ouverte
+# (liste officielle lue sur /api/fr/tools).
 TOOL_ID = int(os.getenv("CROUS_TOOL_ID") or 48)
 
 # Zone : tout Caen + Hérouville-Saint-Clair (Bacot, Côte de Nacre, Lebisey,
@@ -114,22 +115,50 @@ def search(tool_id: int) -> list[dict]:
                                 headers={"Referer": referer}, timeout=(5, 20))
             print(f"   recherche tools/{tool_id} ({mechanism}, {size}) -> HTTP {resp.status_code}")
             if resp.status_code == 200:
-                return resp.json()["results"]["items"]
+                data = resp.json()
+                # Campagne inexistante : le CROUS répond une liste vide « [] »
+                # au lieu de {"results": ...}. Ce n'est pas une erreur : 0 logement.
+                if not isinstance(data, dict) or not isinstance(data.get("results"), dict):
+                    return []
+                return data["results"].get("items") or []
             last_error = f"HTTP {resp.status_code}"
-        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+        except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as e:
             last_error = str(e)
             print(f"   recherche tools/{tool_id} -> {type(e).__name__}")
         time.sleep(4 * attempt)
     raise CrousError(f"Recherche impossible ({last_error})")
 
 
-def find_active_tool() -> tuple[int, list[dict]]:
-    """Trouve la campagne en cours : TOOL_ID, sinon les numéros suivants."""
-    for tool_id in range(TOOL_ID, TOOL_ID + 4):
+def active_tools() -> list[int]:
+    """Numéros des campagnes CROUS ouvertes, lus sur /api/fr/tools.
+    En cas de souci réseau, on garde TOOL_ID."""
+    try:
+        resp = SESSION.get(f"{BASE}/api/fr/tools", timeout=(5, 20))
+        tools = resp.json() if resp.status_code == 200 else None
+        if isinstance(tools, list):
+            ids = [t["id"] for t in tools
+                   if isinstance(t, dict) and t.get("enabled") and t.get("published")]
+            print(f"   campagnes ouvertes : {ids}")
+            return ids
+    except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as e:
+        print(f"   ⚠️ liste des campagnes indisponible ({type(e).__name__})")
+    return [TOOL_ID]
+
+
+def find_active_tool() -> tuple[int | None, list[dict]]:
+    """Choisit la campagne : TOOL_ID s'il est ouvert, sinon une autre ouverte.
+    Renvoie (None, []) s'il n'y a aucune campagne ouverte."""
+    tools = active_tools()
+    if not tools:
+        return None, []
+    candidates = ([TOOL_ID] if TOOL_ID in tools else []) + [t for t in tools if t != TOOL_ID]
+    for tool_id in candidates:
         items = search(tool_id)
         if items:
             return tool_id, items
-    return TOOL_ID, []
+    # Recherche vide = aucun logement affiché en ce moment (cas normal) :
+    # on garde la campagne et on vérifie quand même les logements connus.
+    return candidates[0], []
 
 
 # ── Disponibilités réelles ─────────────────────────────────────────
@@ -251,17 +280,17 @@ def main() -> int:
         print(f"❌ API CROUS : {e}")
         return 1
 
-    print(f"   Campagne : tools/{tool_id} — {len(logements)} logement(s) dans la zone")
-
-    # Garde-fou : zone vide = campagne changée ou site modifié -> prévenir 1x/jour
-    if not logements:
+    # Garde-fou : aucune campagne ouverte sur le site -> prévenir 1x/jour
+    if tool_id is None:
         if state.get("empty_warned") != str(today):
-            send_telegram("⚠️ <b>Bot CROUS : 0 logement trouvé dans la zone.</b>\n"
-                          "La campagne CROUS a peut-être changé. Vérifie le numéro "
-                          "/tools/XX/ dans l'URL du site.")
+            send_telegram("⚠️ <b>Bot CROUS : aucune campagne de logement ouverte.</b>\n"
+                          "Le site du CROUS n'a plus de campagne active. "
+                          "Vérifie sur trouverunlogement.lescrous.fr.")
             state["empty_warned"] = str(today)
             save_state(state)
         return 0
+
+    print(f"   Campagne : tools/{tool_id} — {len(logements)} logement(s) affiché(s) dans la zone")
 
     # Vérifie chaque logement × chaque type d'occupation
     available: dict[str, dict] = {}
